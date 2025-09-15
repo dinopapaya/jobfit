@@ -1,13 +1,23 @@
-from typing import List, Dict
-from sentence_transformers import SentenceTransformer, util
+from typing import List, Dict, Tuple
+from sentence_transformers import SentenceTransformer, util, CrossEncoder
 from rank_bm25 import BM25Okapi
 import numpy as np
 import re
+import os
 
-# small, fast model
-_model = SentenceTransformer("all-MiniLM-L6-v2")
+# -----------------------------
+# Model choices (switchable)
+# -----------------------------
+EMB_MODEL = os.getenv("JOBFIT_EMB_MODEL", "sentence-transformers/multi-qa-MiniLM-L6-cos-v1")
+USE_RERANKER = os.getenv("JOBFIT_USE_RERANKER", "1") == "1"
+RERANKER_MODEL = os.getenv("JOBFIT_RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+TOPK_FOR_RERANK = int(os.getenv("JOBFIT_TOPK_FOR_RERANK", "5"))  # re-rank top-k resume bullets per JD line
 
-# ===== BIG SKILL BANK =====
+# small, high-quality embedding model
+_model = SentenceTransformer(EMB_MODEL)
+_reranker = CrossEncoder(RERANKER_MODEL) if USE_RERANKER else None
+
+# ===== BIG SKILL BANK (lowercase) =====
 SKILL_BANK = {
     # Languages
     "python","c","c++","c#","java","kotlin","scala","go","golang","rust","ruby","php",
@@ -75,89 +85,163 @@ SKILL_BANK = {
     "asyncio","multiprocessing","multithreading","concurrency","parallelism",
 }
 
+# Canonicalization map (normalize aliases to a single key)
+CANON = {
+    "postgresql": "postgres",
+    "rest api": "rest",
+    "nodejs": "node", "node.js": "node", "express.js": "express",
+    "react.js": "react", "reactjs": "react",
+    "nextjs": "next", "next.js": "next",
+    "tailwind css": "tailwind",
+    "google cloud": "gcp",
+    "pgvector": "pgvector",  # keep
+}
+
+def canon(s: str) -> str:
+    s = s.lower().strip()
+    return CANON.get(s, s)
+
+# --- BM25 tokenization & stopwords
 STOPWORDS = {
     "the","a","an","and","or","to","of","in","for","with","on","by","at","from",
     "as","is","are","be","this","that","these","those","you","we","they",
-    "responsibilities","requirements","qualifications","must","ability","will","etc"
+    "title","responsibilities","requirements","qualifications","must","preferred","nice","nice to have",
+    "ability","will","etc"
 }
 TOKEN_RE = re.compile(r"[A-Za-z0-9\+\.\-]+")
 
 def tok(s: str):
     return [t for t in TOKEN_RE.findall(s.lower()) if t not in STOPWORDS]
 
+# ---------- Boundary-aware skill matching ----------
+def has_skill(text: str, skill: str) -> bool:
+    sk = re.escape(skill.lower())
+    # Words like "git" should not match "digital"
+    return re.search(rf"(?<![A-Za-z0-9]){sk}(?![A-Za-z0-9])", text) is not None
+
+# ---------- JD skill parsing (no substring mistakes) ----------
 def parse_required_skills_from_jd(jd_text: str) -> List[str]:
     t = jd_text.lower()
-    found = []
+    found = set()
     for s in SKILL_BANK:
-        if s in t:
-            found.append(s)
-    caps = set(re.findall(r"\b([A-Za-z][A-Za-z0-9+\.\-]{2,})\b", jd_text))
-    for c in caps:
-        low = c.lower()
-        if low in SKILL_BANK and low not in found:
-            found.append(low)
+        s_can = canon(s)
+        if has_skill(t, s) or (s != s_can and has_skill(t, s_can)):
+            found.add(s_can)
     return sorted(found)
 
+# ---------- JD line weighting ----------
+def line_weight(line: str) -> float:
+    l = line.lower()
+    # Requirements / Must-have get more weight
+    if any(k in l for k in ["must have", "required", "requirements", "need to", "minimum"]):
+        return 1.6
+    # Responsibilities / nice-to-have get default or slightly less
+    if any(k in l for k in ["responsibilities", "you will", "nice to have", "preferred"]):
+        return 1.0
+    # Title / headers get less
+    if any(k in l for k in ["title:", "role:", "about the role"]):
+        return 0.6
+    return 1.0
+
+# ---------- Embedding helpers ----------
 def embed(texts: List[str]):
     return _model.encode(texts, normalize_embeddings=True, convert_to_tensor=True)
 
+# Re-rank top-k resume bullets for each JD line with a cross-encoder (if enabled)
+def rerank_best(resume_bullets: List[str], jd_line: str, sims: np.ndarray, topk: int) -> Tuple[int, float]:
+    # sims is the vector of sim scores for this jd_line across all resume bullets
+    top_idx = np.argsort(-sims)[:topk]
+    pairs = [(resume_bullets[i], jd_line) for i in top_idx]
+    scores = _reranker.predict(pairs)  # higher is better
+    best_local = int(top_idx[int(np.argmax(scores))])
+    return best_local, float(max(scores))
+
+# ---------- Scoring ----------
 def jobfit(resume_bullets: List[str], jd_lines: List[str], required_skills: List[str]) -> Dict:
     if not resume_bullets or not jd_lines:
         return {"score": 0.0, "skills_found": [], "skills_missing": required_skills, "matches": []}
 
+    # Embedding sims
     R = embed(resume_bullets)
     J = embed(jd_lines)
-    sim = util.cos_sim(R, J).cpu().numpy()
+    sim = util.cos_sim(R, J).cpu().numpy()  # [len(R), len(J)]
 
-    jd_best = sim.max(axis=0)
-    semantic_cov = float(jd_best.mean())
+    # For each JD line, get best resume bullet (optionally reranked)
+    matches = []
+    weighted_scores = []
+    weights = []
+    for j_idx, jd_line in enumerate(jd_lines):
+        w = line_weight(jd_line)
+        weights.append(w)
 
+        sims_for_j = sim[:, j_idx]
+        if USE_RERANKER and _reranker is not None:
+            r_idx, best_score = rerank_best(resume_bullets, jd_line, sims_for_j, TOPK_FOR_RERANK)
+            # normalize cross-encoder score roughly into [0,1] via sigmoid-like mapping
+            # (cross-encoder outputs are unbounded; this keeps coverage sane)
+            norm = 1.0 / (1.0 + np.exp(-best_score))
+            best_sim = float(norm)
+        else:
+            r_idx = int(np.argmax(sims_for_j))
+            best_sim = float(sims_for_j[r_idx])
+
+        matches.append({
+            "jd_line": jd_line,
+            "resume_bullet": resume_bullets[r_idx],
+            "similarity": best_sim
+        })
+        weighted_scores.append(best_sim * w)
+
+    # Weighted semantic coverage
+    semantic_cov = float(np.sum(weighted_scores) / max(1e-9, np.sum(weights)))
+
+    # BM25 coverage with cleaned tokens
     bm25 = BM25Okapi([tok(b) for b in resume_bullets])
     bm_scores = np.array([np.mean(bm25.get_scores(tok(l))) for l in jd_lines])
     bm_cov = float((bm_scores / (bm_scores.max() + 1e-9)).mean())
 
-    def has_skill(text: str, skill: str) -> bool:
-        if re.fullmatch(r"[A-Za-z][A-Za-z0-9\.\+\-]*", skill):
-            return re.search(rf"(?<![A-Za-z0-9]){re.escape(skill)}(?![A-Za-z0-9])", text) is not None
-        return skill in text  # e.g., "c++"
-
+    # Boundary-aware skill detection on resume text
     resume_text = " ".join(resume_bullets).lower()
-    skills_found = [s for s in required_skills if has_skill(resume_text, s)]
-    skills_missing = [s for s in required_skills if s not in skills_found]
-    skill_cov = (len(skills_found) / max(1, len(required_skills))) if required_skills else 0.0
+    required_can = sorted({canon(s) for s in required_skills})
+    skills_found = [s for s in required_can if has_skill(resume_text, s)]
+    skills_missing = [s for s in required_can if s not in skills_found]
+    skill_cov = (len(skills_found) / max(1, len(required_can))) if required_can else 0.0
 
-    score = 100.0 * (0.5 * semantic_cov + 0.3 * bm_cov + 0.2 * skill_cov)
-
-    matches = []
-    for j_idx, jd_line in enumerate(jd_lines):
-        r_idx = int(sim[:, j_idx].argmax())
-        matches.append({
-            "jd_line": jd_line,
-            "resume_bullet": resume_bullets[r_idx],
-            "similarity": float(sim[r_idx, j_idx])
-        })
+    # Weighted score → 0..100 (tune weights if you like)
+    score = 100.0 * (0.6 * semantic_cov + 0.25 * bm_cov + 0.15 * skill_cov)
 
     return {
         "score": round(score, 2),
         "skills_found": skills_found,
         "skills_missing": skills_missing,
-        "matches": matches[:20],
+        "matches": matches[:20],  # preview
     }
 
+# ---------- Tailoring ----------
 def tailor_bullets(resume_bullets: list[str], jd_lines: list[str], required_skills: list[str], k: int = 6):
     if not resume_bullets or not jd_lines:
         return []
+
     R = embed(resume_bullets)
     J = embed(jd_lines)
     sim = util.cos_sim(R, J).cpu().numpy()
+
     bullet_best = sim.max(axis=1)
     top_idx = np.argsort(-bullet_best)[:k]
+
     jd_text = " ".join(jd_lines).lower()
+    required_can = sorted({canon(s) for s in required_skills})
+
     suggestions = []
     for i in map(int, top_idx):
         b = resume_bullets[i]
         b_low = b.lower()
-        adds = [s for s in required_skills if s not in b_low and s in jd_text][:3]
+        # Add only skills that truly appear in the JD (word boundary) and are missing in this bullet
+        adds = [s for s in required_can if not has_skill(b_low, s) and has_skill(jd_text, s)][:3]
         suggested = f"{b} (add: {', '.join(adds)})" if adds else b
-        suggestions.append({"original": b, "suggested": suggested, "match_score": float(bullet_best[i])})
+        suggestions.append({
+            "original": b,
+            "suggested": suggested,
+            "match_score": float(bullet_best[i])
+        })
     return suggestions
