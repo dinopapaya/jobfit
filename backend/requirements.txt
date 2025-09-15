@@ -5,3 +5,5 @@ rank-bm25
 python-docx
 pdfplumber
 python-multipart
+pymupdf
+spacy
