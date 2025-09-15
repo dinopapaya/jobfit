@@ -1,19 +1,39 @@
 from typing import List
-import io
-import re
+import io, re
 
-# ---------- File readers ----------
+# ---------- Prefer PyMuPDF (fitz) for PDFs; fallback to pdfplumber ----------
 
 def _from_pdf(raw: bytes) -> str:
+    # Try PyMuPDF blocks first (handles multi-column better)
+    try:
+        import fitz  # PyMuPDF
+        text_parts = []
+        with fitz.open(stream=raw, filetype="pdf") as doc:
+            for page in doc:
+                # get_text("blocks") -> tuples (..., text, ...)
+                blocks = page.get_text("blocks")
+                # sort by (y, x) to preserve reading order
+                blocks = sorted(blocks, key=lambda b: (round(b[1]), round(b[0])))
+                for b in blocks:
+                    t = (b[4] or "").strip()
+                    if t:
+                        text_parts.append(t)
+        if text_parts:
+            return "\n".join(text_parts)
+    except Exception:
+        pass
+
+    # Fallback: pdfplumber
     try:
         import pdfplumber
-    except ImportError:
-        raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
-    txt_parts = []
-    with pdfplumber.open(io.BytesIO(raw)) as pdf:
-        for page in pdf.pages:
-            txt_parts.append(page.extract_text() or "")
-    return "\n".join(txt_parts)
+        txt_parts = []
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            for page in pdf.pages:
+                txt_parts.append(page.extract_text() or "")
+        return "\n".join(txt_parts)
+    except Exception:
+        # last resort: return empty; caller handles
+        return ""
 
 def _from_docx(raw: bytes) -> str:
     try:
@@ -49,14 +69,16 @@ def _normalize(text: str) -> str:
         return ""
     t = text.replace("\r\n", "\n").replace("\r", "\n")
     t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"(\w)-\n(\w)", r"\1\2", t)   # join hyphenated line breaks
+    # join hyphenated line breaks: "develop-\nment" -> "development"
+    t = re.sub(r"(\w)-\n(\w)", r"\1\2", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
 HEADING_WORDS = {
     "education","experience","skills","projects","leadership","involvement",
     "honors","awards","summary","objective","responsibilities","requirements",
-    "qualifications","activities","coursework","publications","certifications"
+    "qualifications","activities","coursework","publications","certifications",
+    "title","about","profile","contact","languages"
 }
 
 def _looks_like_heading(line: str) -> bool:
@@ -78,9 +100,58 @@ def _looks_like_heading(line: str) -> bool:
         return True
     return False
 
+def _stitch_short_lines(lines: List[str]) -> List[str]:
+    """
+    Merge short fragments into a preceding line until they form a reasonable sentence.
+    Good for PDFs that split bullets like: "Monitor performance" / "performance."
+    """
+    out: List[str] = []
+    buf = ""
+    def flush():
+        nonlocal buf
+        if buf.strip():
+            out.append(buf.strip())
+        buf = ""
+
+    for line in lines:
+        l = line.strip()
+        if not l:
+            continue
+        if not buf:
+            buf = l
+            continue
+        # If previous is short (<5 tokens) OR doesn't end with sentence punctuation, keep appending.
+        if len(buf.split()) < 5 or not re.search(r"[.!?)]$", buf):
+            buf = f"{buf} {l}"
+        else:
+            flush()
+            buf = l
+    flush()
+    return out
+
+def _spacy_split_paragraphs(lines: List[str]) -> List[str]:
+    """Optional: split longer paragraphs into sentences with spaCy if available."""
+    try:
+        import spacy
+        nlp = spacy.load("en_core_web_sm")
+    except Exception:
+        return lines  # spaCy not available; skip
+    out: List[str] = []
+    for ln in lines:
+        if len(ln) > 180:
+            for s in nlp(ln).sents:
+                ss = s.text.strip()
+                if ss:
+                    out.append(ss)
+        else:
+            out.append(ln)
+    return out
+
 def to_bullets(text: str) -> List[str]:
     if not text:
         return []
+
+    # 1) strip bullet prefixes & headings
     lines: List[str] = []
     for raw_line in text.split("\n"):
         line = re.sub(_BULLET_PREFIXES, "", raw_line).strip(" •\t-–—")
@@ -90,18 +161,20 @@ def to_bullets(text: str) -> List[str]:
             continue
         lines.append(line)
 
-    split_more: List[str] = []
-    for line in lines:
-        if len(line) > 180:
-            split_more.extend(re.split(r"(?<=[.;])\s+(?=[A-Z0-9])", line))
-        else:
-            split_more.append(line)
+    # 2) Stitch short fragments from bad PDF splits
+    lines = _stitch_short_lines(lines)
 
+    # 3) Split long paragraphs via spaCy (if available)
+    lines = _spacy_split_paragraphs(lines)
+
+    # 4) cleanup, dedupe, drop very short/noisy bits
     bullets: List[str] = []
     seen = set()
-    for b in split_more:
+    for b in lines:
         bb = b.strip()
-        if len(bb) < 3:
+        # keep if has >=4 tokens OR contains digits/% OR ends with punctuation
+        tokens = re.findall(r"[A-Za-z0-9\+\.\-]+", bb)
+        if len(tokens) < 4 and not re.search(r"(\d|%)", bb) and not re.search(r"[.!?)]$", bb):
             continue
         key = bb.lower()
         if key in seen:
@@ -109,4 +182,4 @@ def to_bullets(text: str) -> List[str]:
         seen.add(key)
         bullets.append(bb)
 
-    return bullets[:200]
+    return bullets[:250]  # safety cap
