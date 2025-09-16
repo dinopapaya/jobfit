@@ -10,6 +10,8 @@ type ScoreOut = {
 };
 type Tailored = { original: string; suggested: string; match_score: number };
 
+const API = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000";
+
 export default function Home() {
   const [resume, setResume] = useState<File | null>(null);
   const [jd, setJd] = useState("");
@@ -32,7 +34,7 @@ export default function Home() {
 
     setLoading(true);
     try {
-      const res = await fetch("http://127.0.0.1:8000/score", { method: "POST", body: form });
+      const res = await fetch(`${API}/score`, { method: "POST", body: form });
       if (!res.ok) throw new Error(await res.text());
       const data: ScoreOut = await res.json();
       setResult(data);
@@ -55,7 +57,7 @@ export default function Home() {
     form.append("jd", jd);
     form.append("k", "6");
     try {
-      const res = await fetch("http://127.0.0.1:8000/tailor", { method: "POST", body: form });
+      const res = await fetch(`${API}/tailor`, { method: "POST", body: form });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json(); // { bullets: Tailored[] }
       setTailored(data.bullets);
@@ -67,8 +69,15 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-gray-50 text-gray-900">
       <div className="mx-auto max-w-5xl p-6">
-        <h1 className="text-3xl font-semibold">JobFit</h1>
-        <p className="text-gray-600 mt-1">Resume ↔ Job Description matcher</p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-semibold">JobFit</h1>
+            <p className="text-gray-600 mt-1">Resume ↔ Job Description matcher</p>
+          </div>
+          <span className="rounded-full border px-3 py-1 text-xs text-gray-600">
+            API: {API}
+          </span>
+        </div>
 
         <form onSubmit={handleSubmit} className="mt-6 grid gap-4 rounded-2xl bg-white p-5 shadow">
           <div className="grid gap-2">
